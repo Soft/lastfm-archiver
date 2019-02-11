@@ -1,0 +1,16 @@
+[package]
+authors = ["Samuel Laurén <samuel.lauren@iki.fi>"]
+edition = "2018"
+name = "lastfm-archiver"
+version = "0.1.0"
+[dependencies]
+chrono = "0.4.6"
+failure = "0.1.5"
+hyper = "0.12.23"
+hyper-tls = "0.3.1"
+num_cpus = "1.9.0"
+rusqlite = "0.16.0"
+structopt = "0.2.14"
+tokio = "0.1.15"
+urlencoding = "1.0.0"
+xmltree = "0.8.0"
