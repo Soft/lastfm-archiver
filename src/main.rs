@@ -2,7 +2,8 @@ use std::path::PathBuf;
 use std::process;
 use std::str::FromStr;
 
-use chrono::NaiveDateTime;
+use indicatif::{ProgressBar, ProgressStyle};
+use chrono::{Utc, DateTime, Date, Datelike, TimeZone};
 use failure::{err_msg, Error};
 use hyper::client::connect::Connect;
 use hyper::{Client, Request, Body};
@@ -17,6 +18,7 @@ use xmltree::Element;
 
 const DOMAIN: &str = "https://ws.audioscrobbler.com";
 const MAX_TRACKS: u64 = 200;
+const PROGRESS_TEMPLATE: &str = "[{elapsed_precise}] {wide_bar} {pos:>7}/{len:7} ({percent}%)";
 
 #[derive(StructOpt)]
 #[structopt(name = "lastfm-archiver", about = "Archive last.fm listening history.")]
@@ -47,19 +49,18 @@ struct Track {
     album: Option<Album>,
     mbid: Option<String>,
     name: String,
-    time: NaiveDateTime,
+    time: DateTime<Utc>,
 }
 
 impl Track {
     fn insert(&self, connection: &Connection) -> Result<(), Error> {
-        connection
-            .execute(
-                r#"
+        let mut insert = connection.prepare_cached(r#"
           INSERT INTO play (
             time, track_mbid, track_name, artist_mbid, artist_name, album_mbid, album_name
-          ) VALUES (
-            ?1, ?2, ?3, ?4, ?5, ?6, ?7
-          )"#,
+          ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)"#,
+        )?;
+        insert
+            .execute(
                 &[
                     &self.time.timestamp() as &ToSql,
                     &self.mbid as &ToSql,
@@ -118,7 +119,7 @@ impl Track {
             .get("uts")
             .ok_or_else(|| err_msg("missing timestamp"))
             .and_then(|str| i64::from_str(str).map_err(From::from))
-            .map(|secs| NaiveDateTime::from_timestamp(secs, 0))?;
+            .map(|secs| Utc.timestamp(secs, 0))?;
         Ok(Track {
             artist,
             album,
@@ -133,6 +134,7 @@ impl Track {
 struct Response {
     page: u64,
     total_pages: u64,
+    total_tracks: u64,
     tracks: Vec<Track>,
 }
 
@@ -147,6 +149,11 @@ impl Response {
             .attributes
             .get("totalPages")
             .ok_or_else(|| err_msg("missing totalPages"))
+            .and_then(|str| u64::from_str(str).map_err(From::from))?;
+        let total_tracks = response
+            .attributes
+            .get("total")
+            .ok_or_else(|| err_msg("missing total"))
             .and_then(|str| u64::from_str(str).map_err(From::from))?;
         let tracks: Result<Vec<Track>, Error> = response
             .children
@@ -163,6 +170,7 @@ impl Response {
         Ok(Response {
             page,
             total_pages,
+            total_tracks,
             tracks,
         })
     }
@@ -195,7 +203,7 @@ fn fetch_tracks<T>(
     client: Client<T>,
     api_key: String,
     user: String,
-) -> impl Stream<Item = Track, Error = Error>
+) -> impl Stream<Item = Response, Error = Error>
 where
     T: 'static + Sync + Connect,
 {
@@ -231,17 +239,21 @@ where
                         } else {
                             None
                         };
-                        (stream::iter_ok(response.tracks), next)
+                        (response, next)
                     })
             },
         ))
-    }).flatten()
+    })
 }
 
 fn setup_database(connection: &Connection) -> Result<(), Error> {
     connection
         .execute_batch(include_str!("schema.sql"))
         .map_err(From::from)
+}
+
+fn same_month<T: TimeZone>(a: &Date<T>, b: &Date<T>) -> bool {
+    a.month() == b.month() && a.year() == b.year()
 }
 
 fn archiver<T>(
@@ -253,9 +265,23 @@ fn archiver<T>(
 where
     T: 'static + Sync + Connect,
 {
-    future::result(setup_database(&connection)).and_then(|_| {
-        fetch_tracks(client, api_key, user).for_each(move |track| -> Result<(), Error> {
-            track.insert(&connection)?;
+    let bar = ProgressBar::new(0);
+    let mut prev_date = None;
+
+    bar.set_style(ProgressStyle::default_bar().template(PROGRESS_TEMPLATE));
+
+    future::result(setup_database(&connection)).and_then(move |_| {
+        fetch_tracks(client, api_key, user).for_each(move |response| {
+            bar.set_length(response.total_tracks);
+            for track in response.tracks.into_iter() {
+                let track_date = track.time.date();
+                if prev_date.is_none() || !same_month(&prev_date.unwrap(), &track_date) {
+                    bar.println(track_date.format("Archiving %B %Y").to_string())
+                }
+                bar.inc(1);
+                prev_date = Some(track_date);
+                track.insert(&connection)?;
+            }
             Ok(())
         })
     })
